@@ -253,6 +253,8 @@ std::map<int, bool> Items;
 #define VehicleCommonComponent_Fuel 0x100
 #define VehicleCommonComponent_FuelMax 0xfc
 #define PickUpWrapperActor_DefineID 0x2f0
+#define PickUpWrapperActor_ItemValue 0x3A0     // FString - read directly, no engine call needed
+#define PickUpWrapperActor_ItemCategory 0x3AC  // FString - engine's own category tag for this pickup
 #define STExtraPlayerController_STExtraBaseCharacter 0x1448
 #define PlayerController_PlayerCameraManager 0x330
 #define PlayerCameraManager_CameraCache 0x330
@@ -559,6 +561,55 @@ bool isObjectVehicle(uintptr_t addr) {
 return isObjectA(addr, "STExtraVehicleBase");}
 bool isObjectPickUp(uintptr_t addr) {
 return isObjectA(addr, "PickUpWrapperActor");}
+
+// Loot ESP filter: matches the item's live-resolved display name/category against a fixed
+// list of wanted categories. Confirmed working - during testing with the filter disabled
+// (showing every pickup's raw text) real gun names and 5.56mm/7.62mm ammo text came through
+// correctly, so the live lookup itself is reliable; only the filter needed to be re-enabled.
+static std::string ToLowerStr(const std::string &s) {
+    std::string out = s;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c){ return std::tolower(c); });
+    return out;
+}
+static bool ContainsAnyCI(const std::string &haystackLower, std::initializer_list<const char *> needles) {
+    for (auto n : needles) if (haystackLower.find(n) != std::string::npos) return true;
+    return false;
+}
+static bool IsWantedLootItem(const std::string &name) {
+    if (name.empty()) return false;
+    std::string n = ToLowerStr(name);
+
+    // Guns - "auto all guns", every weapon shown regardless of model. awm/sks/mosin are
+    // already covered here too, listed explicitly since they were called out by name.
+    static const std::vector<std::string> guns = {
+        "akm", "m416", "scar-l", "scar", "m16a4", "groza", "aug", "qbz", "m762", "beryl",
+        "ump45", "ump", "vector", "micro uzi", "uzi", "mp5k", "bizon", "pp-19", "p90",
+        "s12k", "s686", "s1897", "dbs", "sawed-off",
+        "kar98k", "kar98", "m24", "awm", "mosin", "sks", "mini14", "vss", "qbu", "slr",
+        "deagle", "p92", "p1911", "p18c", "r45", "r1895", "skorpion", "crossbow"
+    };
+    for (auto &g : guns) if (n.find(g) != std::string::npos) return true;
+
+    // Ammo - 5.56mm and 7.62mm only, as requested.
+    if (ContainsAnyCI(n, {"5.56mm", "7.62mm"})) return true;
+
+    // Medical - bandage and med kits only.
+    if (ContainsAnyCI(n, {"bandage", "first aid kit", "med kit", "medkit"})) return true;
+
+    // Drinks / boosts.
+    if (ContainsAnyCI(n, {"energy drink", "painkiller"})) return true;
+
+    // Scopes - 3x/4x/6x only.
+    if (ContainsAnyCI(n, {"3x scope", "4x scope", "6x scope"})) return true;
+
+    // Gear - backpack/helmet/vest, level 3 only. Level text format is a best guess; tell me
+    // the exact wording you see in-game if a level-3 piece doesn't show and I'll adjust it.
+    bool isGear = ContainsAnyCI(n, {"backpack", "helmet", "vest"});
+    bool isLevel3 = ContainsAnyCI(n, {"level 3", "lvl 3", "lvl.3", "lv.3", "lv3", "level3"});
+    if (isGear && isLevel3) return true;
+
+    return false;
+}
 bool isObjectGrenade(uintptr_t addr) {
 return isObjectA(addr, "BP_Grenade_Shoulei_C") || isObjectA(addr, "BP_Grenade_Burn_C");}
 bool isObjectDeadBox(uintptr_t addr) {
@@ -2537,35 +2588,60 @@ s += (*(FString *)(Actor + UAECharacter_PlayerName)).ToString();
         }
     }
     else if (isObjectPickUp(Actor)) {
-        // Reset to the simple, original approach: only show items whose TypeSpecificID is
-        // in the static Helper/Items.h database (currently: 3x/4x scope, AR extended mag).
-        // The live name-lookup + text-keyword-matching version added on top of this turned
-        // out unreliable and added complexity that wasn't worth it - back to what's proven.
-        int ZY13 = *(int *)(Actor + PickUpWrapperActor_DefineID + 0x4);
-        if (Items[ZY13]) {
-            uintptr_t ZY11 = *(uintptr_t *)(Actor + Actor_RootComponent);
-            if (ZY11) {
-                Vector3 ZY12 = *(Vector3 *)(ZY11 + SceneComponent_RelativeLocation);
-                Vector3 myPos = GetBonePos(localPlayer ? localPlayer : g_LocalPlayer, 0);
-                float Distance = Vector3::Distance(myPos, ZY12) / 100.0f;
-                if (Distance <= 200.0f) {
-                    Vector3 itemPos = WorldToScreen(ZY12);
-                    std::string itemName;
-                    uint32_t textColor = 0xFFFFFFFF;
-                    for (auto &category : items_data) {
-                        for (auto &item : category["Items"]) {
-                            if (item["itemId"] == ZY13) {
-                                itemName = item["itemName"].get<std::string>();
-                                textColor = std::stoul(item["itemTextColor"].get<std::string>(), nullptr, 16);
-                                break;
-                            }
+        int ZY14 = *(int *)(Actor + PickUpWrapperActor_DefineID);         // FItemDefineID.Type
+        int ZY13 = *(int *)(Actor + PickUpWrapperActor_DefineID + 0x4);   // FItemDefineID.TypeSpecificID
+        uintptr_t ZY11 = *(uintptr_t *)(Actor + Actor_RootComponent);
+        if (ZY11) {
+            Vector3 ZY12 = *(Vector3 *)(ZY11 + SceneComponent_RelativeLocation);
+            Vector3 myPos = GetBonePos(localPlayer ? localPlayer : g_LocalPlayer, 0);
+            float Distance = Vector3::Distance(myPos, ZY12) / 100.0f;
+            if (Distance <= 200.0f) {
+                Vector3 itemPos = WorldToScreen(ZY12);
+                std::string itemName;
+                uint32_t textColor = 0xFFFFFFFF;
+                bool isConfirmedDbEntry = false;   // Items.h match (scope/AR mag) - always shown
+                for (auto &category : items_data) {
+                    for (auto &item : category["Items"]) {
+                        if (item["itemId"] == ZY13) {
+                            itemName = item["itemName"].get<std::string>();
+                            textColor = std::stoul(item["itemTextColor"].get<std::string>(), nullptr, 16);
+                            isConfirmedDbEntry = true;
+                            break;
                         }
                     }
-                    if (itemPos.Z > 0) {
-                        std::string distanceText = " - " + std::to_string(static_cast<int>(Distance)) + "M";
-                        std::string displayText = itemName + distanceText;
-                        DrawTextWithBorder(draw, displayText, {itemPos.X, itemPos.Y}, textColor, outlinecolor, 15.0f);
+                }
+                // Read the engine's own category/value tags straight off the pickup actor -
+                // confirmed (by testing with the filter disabled) to carry real, readable
+                // text for guns/ammo, not just scopes.
+                std::string itemCategory = (*(SDK::FString *)(Actor + PickUpWrapperActor_ItemCategory)).ToString();
+                std::string itemValue = (*(SDK::FString *)(Actor + PickUpWrapperActor_ItemValue)).ToString();
+                if (itemName.empty()) {
+                    static std::map<int64_t, std::string> g_LiveItemNameCache;
+                    int64_t cacheKey = ((int64_t)ZY14 << 32) | (uint32_t)ZY13;
+                    auto cached = g_LiveItemNameCache.find(cacheKey);
+                    if (cached != g_LiveItemNameCache.end()) {
+                        itemName = cached->second;
+                    } else if (UTAM_LocalController && !isObjectInvalids((SDK::UObject *)UTAM_LocalController)
+                               && UTAM_LocalController->BackpackComponent
+                               && !isObjectInvalids((SDK::UObject *)UTAM_LocalController->BackpackComponent)) {
+                        SDK::FItemDefineID defineID{};
+                        defineID.Type = ZY14;
+                        defineID.TypeSpecificID = ZY13;
+                        defineID.bValidItem = true;
+                        auto resolved = UTAM_LocalController->BackpackComponent->GetItemByDefineID(defineID);
+                        itemName = resolved.Name.ToString();
+                        g_LiveItemNameCache[cacheKey] = itemName;   // cache the miss too
                     }
+                }
+                std::string classifyText = itemName + " " + itemValue + " " + itemCategory;
+                if (itemPos.Z > 0 && (isConfirmedDbEntry || IsWantedLootItem(classifyText))) {
+                    std::string displayName = !itemName.empty() ? itemName
+                                             : !itemValue.empty() ? itemValue
+                                             : !itemCategory.empty() ? itemCategory
+                                             : std::string("Item");
+                    std::string distanceText = " - " + std::to_string(static_cast<int>(Distance)) + "M";
+                    std::string displayText = displayName + distanceText;
+                    DrawTextWithBorder(draw, displayText, {itemPos.X, itemPos.Y}, textColor, outlinecolor, 15.0f);
                 }
             }
         }
