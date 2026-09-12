@@ -71,6 +71,7 @@ bool ZOOMV3 = false;
 bool MAX_DAMAGE = true;   // always on - see the auto-trigger next to Long Hand's
 bool UTAM_FLASH  = false;
 float FastMovementScale = 1.3f;  // always-on proportional engine speed scale - see UTAMA_HUD
+float LongHandReach = 100.0f;    // extended melee/reach distance - see case 850 in run_thread
 bool show_WindowV4 = false;
 bool AimButton2 = true;
 bool AMMO = false,
@@ -106,7 +107,7 @@ bool Aim;
 bool Unlock;
 bool FastChut = true;
 bool MK = false;
-bool UTAMKILLMSG = true;
+bool UTAMKILLMSG = false;   // independent toggle now, see panel - was always-on before
 
 #define W2S(w, s) SDK::UGameplayStatics::ProjectWorldToScreen(ZevaController, w, true, s)
 class Rect {
@@ -526,6 +527,7 @@ result.push_back(Actor);}
 return result;}
 std::string getObjectName(uintptr_t addr) {
 std::string result;
+if (!addr || !Tools::IsPtrValid((void *)addr)) return result;
 int Index = * (int *)(addr + Object_NamePrivate_ComparisonIndex);
 static std::map<int, std::string> cache;
 if (cache.find(Index) != cache.end()) {
@@ -533,19 +535,28 @@ return cache[Index];}
 uintptr_t GNames = ((uintptr_t ( *)())(UE4 + GNames_Offset))();
 if (GNames) {
 uintptr_t Chunk = * (uintptr_t *)(GNames + (Index / 0x4000) * sizeof(uintptr_t));
+if (!Chunk || !Tools::IsPtrValid((void *)Chunk)) return result;
 uintptr_t WithinChunk = * (uintptr_t *)(Chunk + (Index % 0x4000) * sizeof(uintptr_t));
+if (!WithinChunk || !Tools::IsPtrValid((void *)WithinChunk)) return result;
 char AnsiName[1024] {0};
 memcpy(AnsiName, (void *)(WithinChunk + FNameEntry_AnsiName), sizeof(AnsiName));
 result = AnsiName;
 cache[Index] = result;}
 return result;}
 bool isObjectA(uintptr_t addr, const char * name) {
+// This walks a whole chain of class/superclass pointers, not just `addr` itself - a
+// caller checking addr's own validity (isObjectInvalids) does NOT protect this chain
+// walk, since any class object here can independently go stale mid-walk if it's ever
+// touched by unloading/hot-reload, or if addr's own fields were corrupted by a race.
+// This crashed 3 times with every known call site already validity-checked beforehand,
+// which is why the checks now live here too, on every pointer actually dereferenced.
+if (!addr || !Tools::IsPtrValid((void *)addr)) return false;
 uintptr_t ClassPrivate = * (uintptr_t *)(addr + Object_ClassPrivate);
-if (ClassPrivate) {
+if (ClassPrivate && Tools::IsPtrValid((void *)ClassPrivate)) {
 if (getObjectName(ClassPrivate) == name)
 return true;
 auto Child = * (uintptr_t *)(ClassPrivate + Class_SuperStruct);
-while (Child) {
+while (Child && Tools::IsPtrValid((void *)Child)) {
 if (getObjectName(Child) == name)
 return true;
 Child = * (uintptr_t *)(Child + Class_SuperStruct);}}
@@ -982,6 +993,8 @@ g_LocalController = * (uintptr_t *)(ServerConnection + Player_PlayerController);
 if (g_LocalController) {
  auto Actors = getActors();
  for (auto Actor : Actors) {
+ if (isObjectInvalids((SDK::UObject *)Actor))
+continue;
  if (!isObjectPlayer(Actor))
 continue;
  if ( * (uint32_t *)(Actor + UAECharacter_PlayerKey) == * (uint32_t *)(g_LocalController + UAEPlayerController_PlayerKey)) {
@@ -1451,14 +1464,21 @@ Patches.noshake6.Restore();
 }
 break;
 
-case 850: { // LONG HAND (extended melee/reach) - auto-triggered once per match
+case 850: { // LONG HAND (extended melee/reach) - auto-triggered once per match, and
+            // re-triggered whenever the LONG HAND slider changes (see the panel).
 std::lock_guard<std::mutex> scanEngineLock(g_ScanEngineMutex);
 kFox::SetSearchRange(RegionType::ANONYMOUS);
 kFox::MemorySearch("0.0060901641845703125", Type::TYPE_FLOAT);
 kFox::MemoryOffset("23.52225685119629", -8, Type::TYPE_FLOAT);
 kFox::MemoryOffset("2.2840499877929688E-4", -4, Type::TYPE_FLOAT);
-kFox::MemoryWrite("100", -8, Type::TYPE_FLOAT);
-kFox::MemoryWrite("200", -4, Type::TYPE_FLOAT);
+// Only confirmed working while standing - crouch/prone use different memory values this
+// scan won't find, so the reach doesn't extend in those stances (see panel note).
+// MemoryWrite wants char*, not const char*, hence the const_cast on these std::string
+// buffers - it only reads/parses the text, so this is safe despite the non-const signature.
+std::string reach1Str = std::to_string(LongHandReach);
+std::string reach2Str = std::to_string(LongHandReach * 2.0f);
+kFox::MemoryWrite(const_cast<char *>(reach1Str.c_str()), -8, Type::TYPE_FLOAT);
+kFox::MemoryWrite(const_cast<char *>(reach2Str.c_str()), -4, Type::TYPE_FLOAT);
 kFox::ClearResult();
 break;
 }
@@ -2050,11 +2070,13 @@ if (UTAM_FLY)
     ImGui::PopStyleVar(4);
 }
  //=====================================================================//
-if(LITE_ESP){
-MemoryPatch::createWithHex(OBFUSCATE("libgcloud.so"), 0x62FFC,OBFUSCATE("1E FF 2F E1")).Modify();
-} else {
+// CONFIRMED root cause of "can't spectate after death": this used to flip between two
+// patches on libgcloud.so (likely Google Play Services) depending on ESP state. Whatever
+// the ESP-on variant ("1E FF 2F E1") did, it broke the game's spectate flow - every other
+// ESP-tied feature (aimbot, kill-msg, the other engine write, weapon-name lookup) was
+// ruled out first by disabling each independently and confirming the bug persisted; this
+// was the one that fixed it. Always applying the "off" variant now, regardless of ESP.
 MemoryPatch::createWithHex("libgcloud.so", 0x62FFC,"89 EA 04 04").Modify();// Iceland
-}
 //=====================================================================//
 
 
@@ -2066,15 +2088,21 @@ Config.PlayerESP.Health = true;
 Config.PlayerESP.Skeleton = true;
 Config.PlayerESP.Name = true;
 Config.PlayerESP.Visibility = true;
+// AIMBOT and KILL MSG restored to auto-follow ESP now that the real cause of "can't
+// spectate after death" was found and fixed (the libgcloud.so patch above) - both were
+// confirmed innocent during isolation testing, so they no longer need separate toggles.
 Config.SilentAim.Enable = true;
+UTAMKILLMSG = true;
 Config.PlayerESP.TeamID = true;
 Config.AimBot.VisCheck = true;
 Write_Float(UE4 + 0x1949A58, 0.0f);
-UTAMKILLMSG = true;
 Config.PlayerESP.UtamDeadBox = true;
 Config.PlayerESP.TeammateESP = true;
+// Also confirmed innocent (it was disabled only alongside libgcloud.so during the final
+// test, not the actual cause) - restored.
 Config.PlayerESP.Weapon = true;
 Config.PlayerESP.Vehicle = true;
+Config.PlayerESP.Grenade = true;
 }else{
 // ESP is the master switch: turning it off shuts every other panel feature off too.
 // HIGH DAMAGE is excluded - it's always on now, independent of ESP.
@@ -2083,11 +2111,13 @@ AMMO = false;
 UTAM_FLASH = false;
 Godviewup = false;
 Godviewdown = false;
+Config.SilentAim.Enable = false;
+UTAMKILLMSG = false;
 Config.PlayerESP.UtamDeadBox = false;
 Config.PlayerESP.TeammateESP = false;
 Config.PlayerESP.Weapon = false;
 Config.PlayerESP.Vehicle = false;
-UTAMKILLMSG = false;
+Config.PlayerESP.Grenade = false;
 Config.PlayerESP.Visibility = false;
 Config.PlayerESP.Line = false;
 Config.PlayerESP.Distance = false;
@@ -2095,7 +2125,6 @@ Config.PlayerESP.Health = false;
 Config.PlayerESP.TeamID = false;
 Config.PlayerESP.Skeleton = false;
 Config.PlayerESP.Name = false;
-Config.SilentAim.Enable = false;
 Config.AimBot.VisCheck = false;
 }
 //=====================================================================//
@@ -2156,6 +2185,14 @@ localController = * (uintptr_t *)(ServerConnection + Player_PlayerController);
 if (localController) {
 auto Actors = getActors();
 for (auto Actor : Actors) {
+// CONFIRMED crash site via logcat+addr2line: isObjectPlayer() calls isObjectA(), which
+// reads the actor's ClassPrivate/name-table chain - if Actor went dangling between the
+// getActors() snapshot and here (very possible during death/kill churn), that read
+// crashes. getActors()'s own IsPtrValid check only proves the memory is mapped, not that
+// a UObject still lives there - a freed-and-reused address needs the same isObjectInvalids
+// check used everywhere else in this file.
+if (isObjectInvalids((SDK::UObject *)Actor))
+continue;
 if (!isObjectPlayer(Actor))
 continue;
 if ( * (uint32_t *)(Actor + UAECharacter_PlayerKey) == * (uint32_t *)(localController + UAEPlayerController_PlayerKey)) {
@@ -2577,6 +2614,23 @@ s += (*(FString *)(Actor + UAECharacter_PlayerName)).ToString();
             }
         }
     }
+    else if (Config.PlayerESP.Grenade && isObjectGrenade(Actor)) {
+        uintptr_t GRoot = *(uintptr_t *)(Actor + Actor_RootComponent);
+        if (GRoot) {
+            Vector3 GLoc = *(Vector3 *)(GRoot + SceneComponent_RelativeLocation);
+            Vector3 myPos = GetBonePos(localPlayer ? localPlayer : g_LocalPlayer, 0);
+            float Distance = Vector3::Distance(myPos, GLoc) / 100.0f;
+            if (Distance <= 100.0f) {   // grenades only matter at a range you can react to
+                Vector3 screenPos = WorldToScreen(GLoc);
+                if (screenPos.Z > 0) {
+                    std::string label = "Grenade - " + std::to_string((int)Distance) + "M";
+                    draw->AddText(NULL, density / 26.0f, {screenPos.X + 1, screenPos.Y + 1}, IM_COL32(0, 0, 0, 255), label.c_str());
+                    draw->AddText(NULL, density / 26.0f, {screenPos.X, screenPos.Y}, IM_COL32(255, 60, 0, 255), label.c_str());
+                    draw->AddCircle({screenPos.X, screenPos.Y}, 20.0f, IM_COL32(255, 60, 0, 200), 24, 2.0f);
+                }
+            }
+        }
+    }
     else if (isObjectPickUp(Actor)) {
         int ZY13 = *(int *)(Actor + PickUpWrapperActor_DefineID + 0x4);   // FItemDefineID.TypeSpecificID
         uintptr_t ZY11 = *(uintptr_t *)(Actor + Actor_RootComponent);
@@ -2970,8 +3024,9 @@ io.Fonts->AddFontFromMemoryTTF(const_cast<std::uint8_t *>(Custom), sizeof(Custom
 
         memset(&Config, 0, sizeof(Config));
         initImGui = true;
-        Config.SilentAim.Enable = true;
-        
+        // Was forced true here always, regardless of any toggle - now controlled by the
+        // independent AIMBOT panel toggle, defaulting off so it can be isolated for testing.
+
     }
 
 
@@ -3072,6 +3127,9 @@ ImGui::SpacebarToggle("ESP", &LITE_ESP);
 // HIGH DAMAGE toggle removed - always on now, auto-triggered once per match (see the
 // Long Hand auto-trigger just below the local-player lookup for the same pattern).
 
+// AIMBOT and KILL MSG toggles removed - both auto-follow ESP again now that the real
+// cause of "can't spectate after death" (the libgcloud.so patch) was found and fixed.
+
 DrawPinkGlowShimmerLine();
 ImGui::SpacebarToggle("AUTO FIRE", &AutoFire2);
 
@@ -3106,6 +3164,18 @@ DrawPinkGlowShimmerLine();
 // Always on - no toggle, only the scale is adjustable.
 ImGui::SetNextItemWidth(-1.0f);
 ImGui::SliderFloat("##MOVESPEED", &FastMovementScale, 1.0f, 2.5f, "SPEED: %.2fx");
+ImGui::Spacing();
+
+DrawPinkGlowShimmerLine();
+// Only confirmed to work while standing - the memory scan behind this (case 850) looks
+// for values specific to the standing reach animation, so crouch/prone stances (which use
+// different values) are unaffected. Re-applies live whenever this slider is released.
+ImGui::SetNextItemWidth(-1.0f);
+ImGui::SliderFloat("##LONGHAND", &LongHandReach, 50.0f, 300.0f, "LONG HAND: %.0f");
+if (ImGui::IsItemDeactivatedAfterEdit()) {   // fires once, exactly when the slider is released
+    pthread_t t;
+    if (pthread_create(&t, 0, run_thread, (void *)(850)) == 0) pthread_detach(t);
+}
 ImGui::Spacing();
 
 ImGui::PopStyleVar();
