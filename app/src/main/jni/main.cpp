@@ -2338,6 +2338,7 @@ if (Config.PlayerESP.ESPUIType == EESPUIType::ESPUI01) {
             }
         };
 
+        bool anySegmentDrawn = false;
         for (const auto & boneStructure: skeleton) {
             int lastBone = 0;
             for (int currentBone: boneStructure) {
@@ -2346,10 +2347,24 @@ if (Config.PlayerESP.ESPUIType == EESPUIType::ESPUI01) {
                     Vector3 boneTo = WorldToScreen(GetBonePos(Actor, lastBone));
                     if (boneFrom.Z > 0 && boneTo.Z > 0) {
                         draw->AddLine({boneFrom.X, boneFrom.Y}, {boneTo.X, boneTo.Y}, U1SCOLOR, 1.8f);
+                        anySegmentDrawn = true;
                     }
                 }
                 lastBone = currentBone;
             }
+        }
+        // Distant enemies often have no individual limb bone data available (likely reduced
+        // animation replication at range - the engine's own limitation, not something this
+        // code controls), so every segment above silently fails and nothing was drawn at all.
+        // RootPosSC/HeadPosSC stay accurate at any distance (the Line feature already proves
+        // that), so fall back to a simple body outline instead of showing nothing.
+        if (!anySegmentDrawn) {
+            float top = std::min(HeadPosSC.Y, RootPosSC.Y);
+            float bottom = std::max(HeadPosSC.Y, RootPosSC.Y);
+            float bodyHeight = bottom - top;
+            float halfWidth = bodyHeight * 0.18f;
+            float centerX = (HeadPosSC.X + RootPosSC.X) / 2.0f;
+            draw->AddRect({centerX - halfWidth, top}, {centerX + halfWidth, bottom}, U1SCOLOR, 2.0f, 0, 1.5f);
         }
     }
 
@@ -2357,35 +2372,32 @@ if (Config.PlayerESP.ESPUIType == EESPUIType::ESPUI01) {
     ImVec2 rectCenter;
 
     		        if (Config.PlayerESP.Health) {
-                             auto PlayerHealth = *(float *)(uintptr_t(Actor) + STExtraCharacter_Health);
-        auto PlayerHealthMax = *(float *)(uintptr_t(Actor) + STExtraCharacter_HealthMax);
-        int CurHP = std::clamp(static_cast < int > (PlayerHealth), 0, static_cast < int > (PlayerHealthMax));
-        int MaxHP = static_cast < int > (PlayerHealthMax);
-        long HPColor;
+                        auto PlayerHealth = *(float *)(uintptr_t(Actor) + STExtraCharacter_Health);
+                        auto PlayerHealthMax = *(float *)(uintptr_t(Actor) + STExtraCharacter_HealthMax);
+                        int MaxHP = static_cast<int>(PlayerHealthMax);
+                        if (MaxHP > 0) {
+                            int CurHP = std::clamp(static_cast<int>(PlayerHealth), 0, MaxHP);
+                            float hpFraction = (float)CurHP / (float)MaxHP;
 
-                                HPColor = U1HPCOLOR;
-										  
-                                                       
-                           //             int CurHP = (int) std::max(0, std::min((int) Player->Health,100));
+                            // Discrete 3-color bar: green = healthy, orange = medium, red = low.
+                            ImU32 barColor = hpFraction >= 0.6f ? IM_COL32(40, 220, 60, 255)
+                                           : hpFraction >= 0.3f ? IM_COL32(255, 165, 0, 255)
+                                           : IM_COL32(230, 40, 40, 255);
 
-float boxWidth = density / 1.6f;
-                                                boxWidth -= std::min(
-                                                        ((boxWidth / 2) / 0.001f) * Distance,
-                                                        boxWidth / 2);
-                                                float boxHeight = boxWidth * 0.15f;
+                            float refWidth = density / 1.6f;
+                            refWidth -= std::min(((refWidth / 2) / 0.001f) * Distance, refWidth / 2);
+                            float barWidth = refWidth * 0.5f;              // small bar, not the old full-width box
+                            float barHeight = std::max(refWidth * 0.05f, 3.0f);
 
+                            ImVec2 barStart = {HeadPosSC.X - barWidth / 2.0f, HeadPosSC.Y - (barHeight * 4.0f)};
+                            ImVec2 barEnd   = {barStart.x + barWidth, barStart.y + barHeight};
+                            ImVec2 fillEnd  = {barStart.x + barWidth * hpFraction, barEnd.y};
 
-                                                ImVec2 vStart = {HeadPosSC.X - (boxWidth / 2), HeadPosSC.Y - (boxHeight * 2.001f)};
-
-                                                ImVec2 vEndFilled = {vStart.x + (CurHP * boxWidth / MaxHP), 
-												                     vStart.y + boxHeight};
-												
-                                                ImVec2 vEndRect = {vStart.x + boxWidth, vStart.y + boxHeight};
-																   
-												// Removed the filled red/green health box (was AddRectFilledMultiColor + AddRect
-// here) - it rendered as an unwanted colored background box near the name.
-                                                (void)vEndFilled; (void)vEndRect; (void)HPColor;
-                                            }
+                            draw->AddRectFilled(barStart, barEnd, IM_COL32(0, 0, 0, 160));       // dark backing
+                            draw->AddRectFilled(barStart, fillEnd, barColor);                    // health fill
+                            draw->AddRect(barStart, barEnd, IM_COL32(0, 0, 0, 200), 0.0f, 0, 1.0f); // thin border
+                        }
+                    }
                      
                                             
                                                                    
@@ -2558,22 +2570,13 @@ s += (*(FString *)(Actor + UAECharacter_PlayerName)).ToString();
                         }
                     }
                 }
-                // CONFIRMED via screenshot: the live GetItemByDefineID lookup and the raw
-                // ItemCategory/ItemValue actor fields are ALL empty for every ordinary ground
-                // item - only the two hardcoded Items.h entries (scope, AR mag) ever showed
-                // real text, because that came from the static database, not any live source.
-                // There is no live name/category data available for generic loot, so that
-                // whole approach (and the per-item engine call it required) is removed.
-                // Confirmed items still show their real name; everything else shows its
-                // numeric ID so real gun/ammo IDs can be read once and added to Items.h the
-                // same way the AR mag was - the only approach that has ever actually worked.
-                // Also cut to 40m (was 200m) so this diagnostic pass isn't cluttering the
-                // whole screen while testing.
-                if (itemPos.Z > 0 && Distance <= 40.0f) {
+                // Only items added to Helper/Items.h show, with their real configured name -
+                // no live name/category source exists for arbitrary items (confirmed earlier),
+                // so anything not in that file is skipped entirely rather than showing a raw
+                // ID and cluttering the screen. Add new items there as they're found.
+                if (itemPos.Z > 0 && isConfirmedDbEntry) {
                     std::string distanceText = " - " + std::to_string(static_cast<int>(Distance)) + "M";
-                    std::string displayText = isConfirmedDbEntry
-                        ? (itemName + distanceText)
-                        : ("#" + std::to_string(ZY13) + distanceText);
+                    std::string displayText = itemName + distanceText;
                     DrawTextWithBorder(draw, displayText, {itemPos.X, itemPos.Y}, textColor, outlinecolor, 15.0f);
                 }
             }
@@ -3078,41 +3081,15 @@ ImGui::Spacing();
 
 ImGui::PopStyleVar();
 
-DrawPinkGlowShimmerLine();
-DrawPinkGlowShimmerLine();
-
-float totalWidth = ImGui::GetContentRegionAvail().x;
-float spacing = ImGui::GetStyle().ItemSpacing.x;
-float buttonWidth = (totalWidth - spacing) * 0.5f;
-
 // GOD MENU toggle button removed - the quick-access window (UP/DN + BOT/NOK/BT) is
 // always on screen now, so a separate on/off switch for it no longer does anything.
 
-// ===== SKY PANEL Button =====
-if (UTAM_FLY) {
-    // Active State: Neon Hot Pink / Magenta Glow
-    ImGui::PushStyleColor(ImGuiCol_Button,        IM_COL32(255, 50, 150, 255));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(255, 90, 175, 255));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  IM_COL32(204, 25, 115, 255));
-    ImGui::Button("SKY FLY", ImVec2(buttonWidth, 50)); 
-    ImGui::PopStyleColor(3);
-} else {
-    // Inactive State: Dark Purple Base
-    ImGui::PushStyleColor(ImGuiCol_Button,        IM_COL32(56, 8, 31, 255));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(89, 13, 51, 255));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  IM_COL32(204, 25, 115, 255));
-    ImGui::Button("SKY FLY", ImVec2(buttonWidth, 50)); //@UTAMARAM95
-    ImGui::PopStyleColor(3);
+DrawPinkGlowShimmerLine();
+if (ImGui::SpacebarToggle("SKY FLY", &UTAM_FLY)) {
+    pthread_t t;
+    pthread_create(&t, 0, run_thread, (void *)(4451));
 }
 
-if (ImGui::IsItemClicked()) {
-    pthread_t t;
-    UTAM_FLY = !UTAM_FLY;
-
-pthread_create(&t, 0, run_thread, (void *)(4451));}
-ImGui::Spacing(); 
-DrawPinkGlowShimmerLine();
-DrawPinkGlowShimmerLine();
 ImGui::TableNextColumn();
 }}
 ImGui::End();
