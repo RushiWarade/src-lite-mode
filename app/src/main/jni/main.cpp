@@ -807,8 +807,17 @@ ASTExtraPlayerCharacter *GetTargetForAim() {
 void (*orig_shoot_event)(USTExtraShootWeaponComponent *Thiz, FVector start, FRotator rot, void *unk1, int unk2) = 0;
 void shoot_event(USTExtraShootWeaponComponent *thiz, FVector start, FRotator rot, ASTExtraShootWeapon *weapon, int unk1)
 {
-
-    if (Config.SilentAim.Enable)
+    // This hook lives on the weapon CLASS's shared vtable slot (see the installation site
+    // below), so it fires for every instance of this weapon type fired by ANYONE - enemies,
+    // teammates, bots - not just you. Without checking that `weapon` is actually your own
+    // currently-equipped weapon, an enemy's shot (including the exact shot that kills you)
+    // gets its aim silently rewritten using your own aimbot target - corrupting that shot's
+    // data right at the moment of a kill. That is the likely cause of "can't spectate after
+    // being killed while ESP/aimbot was on": the killing shot itself was tampered with.
+    bool isMyWeapon = UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)
+                       && UTAM_LocalPlayer->WeaponManagerComponent
+                       && (SDK::ASTExtraShootWeapon *)UTAM_LocalPlayer->WeaponManagerComponent->CurrentWeaponReplicated == weapon;
+    if (isMyWeapon && Config.SilentAim.Enable)
     {
         ASTExtraPlayerCharacter *Target = GetTargetForAim();
         if (FastChut) {
@@ -831,8 +840,15 @@ void shoot_event(USTExtraShootWeaponComponent *thiz, FVector start, FRotator rot
 FRotator (*oCalcShootRot)(USTExtraShootWeaponComponent *pObj);
 FRotator CalcShootRot(USTExtraShootWeaponComponent *pObj)
 {
-
-    if (Config.SilentAim.Enable)
+    // Same non-per-instance hook problem as shoot_event above: this fires for every shot
+    // computed by anyone's weapon, not just yours. Verify pObj is actually your own weapon's
+    // component before ever touching aim - otherwise this hijacks other players' (including
+    // the killer's) shot rotation using your own aimbot target.
+    bool isMyWeapon = UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)
+                       && UTAM_LocalPlayer->WeaponManagerComponent
+                       && UTAM_LocalPlayer->WeaponManagerComponent->CurrentWeaponReplicated
+                       && ((SDK::ASTExtraShootWeapon *)UTAM_LocalPlayer->WeaponManagerComponent->CurrentWeaponReplicated)->ShootWeaponComponent == pObj;
+    if (isMyWeapon && Config.SilentAim.Enable)
     {
         ASTExtraPlayerCharacter *Target = GetTargetForAim();
         // Native hook fired on every shot, including shots fired near you by someone
@@ -985,11 +1001,15 @@ if (ParachuteComp && !isObjectInvalids((SDK::UObject *)ParachuteComp)) {
     ParachuteComp->CurrentFallSpeed = 9999.9f;
 }
 auto WeaponManagerComponent = UTAM_LocalPlayer->WeaponManagerComponent;
-if (WeaponManagerComponent){
+// CONFIRMED crash site via logcat+addr2line: WeaponManagerComponent was only null-checked,
+// never validity-checked. UTAM_LocalPlayer being valid does not guarantee its
+// WeaponManagerComponent sub-object still is - weapon-related components can be torn down
+// independently right around a kill/death transition, which is exactly when this crashed.
+if (WeaponManagerComponent && !isObjectInvalids((SDK::UObject *)WeaponManagerComponent)){
 auto CurrentWeaponReplicated = (SDK::ASTExtraShootWeapon *)WeaponManagerComponent->CurrentWeaponReplicated;
-if (CurrentWeaponReplicated){
-localWeapon = CurrentWeaponReplicated;        
-if (localWeapon) {    
+if (CurrentWeaponReplicated && !isObjectInvalids((SDK::UObject *)CurrentWeaponReplicated)){
+localWeapon = CurrentWeaponReplicated;
+if (localWeapon) {
 auto ShootWeaponComponent = CurrentWeaponReplicated->ShootWeaponComponent;
 if (ShootWeaponComponent) {
 SDK::UShootWeaponEntity *ShootWeaponEntityComponent = ShootWeaponComponent->ShootWeaponEntityComponent;
@@ -1065,10 +1085,19 @@ if(UTAM_LocalPlayer&&!isObjectInvalids((SDK::UObject*)UTAM_LocalPlayer)&&UTAM_Lo
 auto WeaponManagerComponent=UTAM_LocalPlayer->WeaponManagerComponent;
 if(WeaponManagerComponent){
 auto CurrentWeaponReplicated=(ASTExtraShootWeapon*)WeaponManagerComponent->CurrentWeaponReplicated;
-if(CurrentWeaponReplicated){
+if(CurrentWeaponReplicated && !isObjectInvalids((SDK::UObject*)CurrentWeaponReplicated)){
 auto Records=UTAM_LocalController->ClientFatalDamageRecords;
 std::string myName=UTAM_LocalPlayer->PlayerName.ToString();
-for(int i=0;i<Records.Num();i++){
+// ClientFatalDamageRecords is actively written to by the engine at the exact moment a
+// kill/death happens - the same TArray-race class of bug fixed earlier in getActors().
+// Records here is a shallow copy (shares the live Data pointer), so a mutation during
+// iteration can leave Num() and Data out of sync. A sane upper bound stops a corrupted
+// count from walking off into unmapped memory - this is the likely real fix for
+// "crash when I die" and "chicken dinner does nothing", since both are moments this
+// exact record list gets a new entry appended.
+int recordCount = Records.Num();
+if (recordCount > 0 && recordCount < 64) {
+for(int i=0;i<recordCount;i++){
 auto& record=Records[i];
 if(record.Causer.ToString()==myName){
 const char* weaponName=CurrentWeaponReplicated->GetWeaponName().ToString();
@@ -1096,7 +1125,7 @@ else if(strstr(weaponName,"SKS"))record.CauserWeaponAvatarID=1103004037;
 else if(strstr(weaponName,"Pan"))record.CauserWeaponAvatarID=1108004125;
 else if(strstr(weaponName,"Vss"))record.CauserWeaponAvatarID=1103005024;
 else if(strstr(weaponName,"S1897"))record.CauserWeaponAvatarID=1104002022;
-else if(strstr(weaponName,"S12K"))record.CauserWeaponAvatarID=1104003026;}}}}}
+else if(strstr(weaponName,"S12K"))record.CauserWeaponAvatarID=1104003026;}}}}}}
 
 if (g_LocalPlayer) {
 auto infinity = std::numeric_limits<float>::infinity();
