@@ -3051,6 +3051,11 @@ io.Fonts->AddFontFromMemoryTTF(const_cast<std::uint8_t *>(Custom), sizeof(Custom
 ImVec2 center = ImGui::GetMainViewport()->GetCenter();
 
   if (LITE_ESP) {   // God Menu quick-access window (UP/DN + BOT/NOK/BT) - tied to the ESP switch.
+	  // Pinned to a fixed top-left spot every frame - this window can never come to front
+	  // (NoBringToFrontOnFocus below), so if it isn't kept clear of the main panel's area,
+	  // an overlap silently steals clicks meant for these buttons and routes them to
+	  // whatever's on top instead - which is what was happening to the jump buttons.
+	  ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
 	  ImGui::SetNextWindowSize(ImVec2(210, 0), ImGuiCond_Always);
 	  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
 	  if (ImGui::Begin(" ", 0, ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar )) {
@@ -3081,14 +3086,39 @@ ImGui::Checkbox("BT", &SKYSHOT);
 // One-shot jump boosts, triggered directly on click via the engine's own LaunchCharacter()
 // (the same official API a real jump pad / boost pad uses) - not a persistent memory
 // patch, so it works immediately with no per-match setup.
-if (ImGui::Button("HI JMP", ImVec2(gbw, 28)) && UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)) {
-    UTAM_LocalPlayer->LaunchCharacter(FVector(0.0f, 0.0f, 900.0f), false, true);
+// Uses g_LocalPlayer (populated from the same lookup ESP itself relies on every frame),
+// not UTAM_LocalPlayer (a separate, less reliable lookup) - using the latter here meant
+// the click registered fine but the action silently no-op'd whenever that lookup lagged,
+// which looked exactly like "the button doesn't work".
+// Confirms the click actually fired the launch, regardless of whether the jump itself is
+// noticeable - without this there was no way to tell "click did nothing" apart from
+// "click worked but the jump was subtle", which is exactly what made the last bug hard
+// to describe. Fades out over ~1 second.
+static float lastJumpMsgTime = -100.0f;
+static const char *lastJumpMsgText = "";
+if (ImGui::Button("HJ", ImVec2(gbw, 28)) && g_LocalPlayer && !isObjectInvalids((SDK::UObject *)g_LocalPlayer)) {
+    ((SDK::ASTExtraPlayerCharacter *)g_LocalPlayer)->LaunchCharacter(FVector(0.0f, 0.0f, 900.0f), false, true);
+    lastJumpMsgText = "HIGH JUMP!";
+    lastJumpMsgTime = (float)ImGui::GetTime();
 }
 ImGui::SameLine();
-if (ImGui::Button("LNG JMP", ImVec2(gbw, 28)) && UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)) {
+if (ImGui::Button("LJ", ImVec2(gbw, 28)) && g_LocalPlayer && !isObjectInvalids((SDK::UObject *)g_LocalPlayer)) {
     float yawRad = GetPOV().Rotation.Yaw * (3.14159265358979323846f / 180.0f);
     FVector boost(cosf(yawRad) * 900.0f, sinf(yawRad) * 900.0f, 450.0f);
-    UTAM_LocalPlayer->LaunchCharacter(boost, true, true);
+    ((SDK::ASTExtraPlayerCharacter *)g_LocalPlayer)->LaunchCharacter(boost, true, true);
+    lastJumpMsgText = "LONG JUMP!";
+    lastJumpMsgTime = (float)ImGui::GetTime();
+}
+float jumpMsgAge = (float)ImGui::GetTime() - lastJumpMsgTime;
+if (jumpMsgAge >= 0.0f && jumpMsgAge < 1.0f) {
+    float alpha = 1.0f - (jumpMsgAge / 1.0f);
+    ImDrawList *fg = ImGui::GetForegroundDrawList();
+    ImVec2 textSize = ImGui::CalcTextSize(lastJumpMsgText, nullptr, false, -1.0f);
+    ImVec2 pos = {(float)glWidth / 2.0f - textSize.x, (float)glHeight * 0.35f};
+    ImU32 col = IM_COL32(255, 220, 60, (int)(255 * alpha));
+    ImU32 outline = IM_COL32(0, 0, 0, (int)(200 * alpha));
+    fg->AddText(NULL, 32.0f, {pos.x + 1, pos.y + 1}, outline, lastJumpMsgText);
+    fg->AddText(NULL, 32.0f, pos, col, lastJumpMsgText);
 }
 	}
 	ImGui::End();
