@@ -589,6 +589,10 @@ resultPos.Y = ((float) glHeight / 2) - ((float) glHeight / 2) * screenY / screen
 resultPos.X = ((float) glWidth / 2) + ((float) glWidth / 2) * screenX / screenW;}}
 return resultPos;}
 Vector3 GetBonePos(uintptr_t Actor, int Idx) {
+// Several callers use a "localPlayer ? localPlayer : g_LocalPlayer" style fallback that
+// can still be 0 in the brief window right after death before g_LocalPlayer refreshes -
+// without this check, reading (0 + Character_Mesh) is a near-null read and crashes.
+if (!Actor) return {0, 0, 0};
 auto GetBonePos = (Vector3( *)(uintptr_t, uint64_t))(UE4 + GetBonePos_Offset);
 auto GetBoneName = (uint64_t * ( *)(uint64_t *, uintptr_t, int))(UE4 + GetBoneName_Offset); //correct
 auto Mesh = * (uintptr_t *)(Actor + Character_Mesh);
@@ -2218,10 +2222,15 @@ if (localPlayer && localPlayer != lastValidPlayerForHighDamage) {
     if (pthread_create(&tHighDamage, 0, run_thread, (void *)(6)) == 0) pthread_detach(tHighDamage);
 }
 if (!localPlayer) lastValidPlayerForHighDamage = 0;
-// ESP-while-dead removed entirely per request - it was the source of repeated crash-on-
-// death reports (cachedTeamID/localPlayer=0 fallback reading stale actor state). ESP now
-// simply stops when your character is gone, same as before that feature was added.
-if (localPlayer) {
+// ESP-while-dead (spectating a teammate) re-added. The earlier crash-on-death reports
+// were traced to specific unguarded reads inside this block (WeaponManagerComponent,
+// the radar sub-block dereferencing localPlayer directly, isObjectA's class-chain walk),
+// all of which have since been fixed at the source rather than by disabling the feature.
+// cachedTeamID keeps last known team id so distance/team-check math keeps working once
+// localPlayer goes to 0 on death; it refreshes automatically at the start of each match.
+static int cachedTeamID = -999;
+if (localPlayer) cachedTeamID = *(int *)(localPlayer + UAECharacter_TeamID);
+if (localPlayer || cachedTeamID != -999) {
 // UTAM_LocalPlayer is a separate global from localPlayer (set by a different hook) and
 // localPlayer being valid doesn't guarantee UTAM_LocalPlayer still is - it needs its own check.
 if (localPlayer && Config.SilentAim.Enable && UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer))
@@ -2265,8 +2274,11 @@ if (localPlayer && Config.SilentAim.Enable && UTAM_LocalPlayer && !isObjectInval
                 }
             }
         }
-Vector3 myPos = GetBonePos(localPlayer, 0);
-            int myTeamID = *(int *)(localPlayer + UAECharacter_TeamID);
+// When dead, localPlayer is 0 - GetBonePos(0, 0) would read near-null and crash, so fall
+// back to the camera position (which follows whoever you're spectating) and the cached
+// team id from the match you were just in.
+Vector3 myPos = localPlayer ? GetBonePos(localPlayer, 0) : GetPOV().Location;
+            int myTeamID = cachedTeamID;
             ImU32 U1SCOLOR, U1HPCOLOR;
             ImU32 SCOLOR, SCOLOR2, SCOLOR3, SCOLOR4, NAME,HPColor;
             for (auto Actor : Actors) {
@@ -3065,6 +3077,19 @@ if (dnOn) ImGui::PopStyleColor(2);
 ImGui::Checkbox("BOT", &Config.AimBot.IgnoreBot);
 ImGui::Checkbox("NOK", &Config.AimBot.IgnoreKnocked);
 ImGui::Checkbox("BT", &SKYSHOT);
+
+// One-shot jump boosts, triggered directly on click via the engine's own LaunchCharacter()
+// (the same official API a real jump pad / boost pad uses) - not a persistent memory
+// patch, so it works immediately with no per-match setup.
+if (ImGui::Button("HI JMP", ImVec2(gbw, 28)) && UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)) {
+    UTAM_LocalPlayer->LaunchCharacter(FVector(0.0f, 0.0f, 900.0f), false, true);
+}
+ImGui::SameLine();
+if (ImGui::Button("LNG JMP", ImVec2(gbw, 28)) && UTAM_LocalPlayer && !isObjectInvalids((SDK::UObject *)UTAM_LocalPlayer)) {
+    float yawRad = GetPOV().Rotation.Yaw * (3.14159265358979323846f / 180.0f);
+    FVector boost(cosf(yawRad) * 900.0f, sinf(yawRad) * 900.0f, 450.0f);
+    UTAM_LocalPlayer->LaunchCharacter(boost, true, true);
+}
 	}
 	ImGui::End();
 	ImGui::PopStyleVar();
